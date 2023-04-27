@@ -53,3 +53,7 @@ dkms.conf
 
 #General
 .DS_Store
+
+#Test Files
+*test*
+*.sh
