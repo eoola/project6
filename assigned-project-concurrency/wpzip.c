@@ -1,47 +1,117 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
 #include <pthread.h>
 
-#define CHUNK_SIZE 1024
+#define MAX_THREADS 16
+#define QUEUE_SIZE 100
 
-char uncompressed_data[CHUNK_SIZE];
-int uncompressed_size = 0;
+static char prev_char;
+uint32_t count;
 
-struct CompressedChunk
+// Queue to hold file names
+typedef struct
 {
-    int count;
-    char value;
-};
+    char **files;
+    int front, rear, size;
+} FileQueue;
 
-struct CompressedChunk compressed_data[CHUNK_SIZE];
-int compressed_size = 0;
-
-void *compress_chunk(void *arg)
+// Initialize the file queue
+void init_file_queue(FileQueue *queue)
 {
-    int *chunk_index = (int *)arg;
+    queue->front = 0;
+    queue->rear = -1;
+    queue->size = 0;
+    queue->files = malloc(sizeof(char *) * QUEUE_SIZE);
+}
 
-    int i;
-    char current_char = uncompressed_data[(*chunk_index) * CHUNK_SIZE];
-    int count = 1;
-    for (i = 1; i < CHUNK_SIZE; i++)
+// Check if file queue is empty
+int is_file_queue_empty(FileQueue *queue)
+{
+    return (queue->size == 0);
+}
+
+// Check if file queue is full
+int is_file_queue_full(FileQueue *queue)
+{
+    return (queue->size == QUEUE_SIZE);
+}
+
+// Add a file name to the file queue
+void enqueue_file(FileQueue *queue, char *file)
+{
+    if (!is_file_queue_full(queue))
     {
-        char next_char = uncompressed_data[(*chunk_index) * CHUNK_SIZE + i];
-        if (next_char == current_char)
+        queue->rear = (queue->rear + 1) % QUEUE_SIZE;
+        queue->files[queue->rear] = file;
+        queue->size++;
+    }
+}
+
+// Remove a file name from the file queue
+char *dequeue_file(FileQueue *queue)
+{
+    if (!is_file_queue_empty(queue))
+    {
+        char *file = queue->files[queue->front];
+        queue->front = (queue->front + 1) % QUEUE_SIZE;
+        queue->size--;
+        return file;
+    }
+    return NULL;
+}
+
+// RLE compression function
+void rle_compress(char *s, FILE *fp_out)
+{
+    for (int i = 0; i < strlen(s); i++)
+    {
+        char cur_char = s[i];
+        if (cur_char == prev_char)
         {
+            // same character as previous one, increment count
             count++;
         }
         else
         {
-            compressed_data[(*chunk_index) * CHUNK_SIZE + compressed_size].count = count;
-            compressed_data[(*chunk_index) * CHUNK_SIZE + compressed_size].value = current_char;
-            compressed_size++;
-            current_char = next_char;
+            // different character, write out the previous count and char
+            if (prev_char != '\0')
+            {
+                fwrite(&count, sizeof(uint32_t), 1, fp_out);
+                fwrite(&prev_char, sizeof(char), 1, fp_out);
+            }
+            // reset count for the new character
             count = 1;
+            prev_char = cur_char;
         }
     }
+}
 
-    compressed_data[(*chunk_index) * CHUNK_SIZE + compressed_size].count = count;
-    compressed_data[(*chunk_index) * CHUNK_SIZE + compressed_size].value = current_char;
-    compressed_size++;
+// Worker thread function
+void *compress_file(void *arg)
+{
+    FileQueue *queue = (FileQueue *)arg;
+    char *file;
+
+    while ((file = dequeue_file(queue)) != NULL)
+    {
+        FILE *fp_in = fopen(file, "r");
+        if (fp_in == NULL)
+        {
+            fprintf(stderr, "Error: cannot open file '%s'\n", file);
+            continue;
+        }
+        char *line = NULL;
+        size_t len = 0;
+        ssize_t read;
+        while ((read = getline(&line, &len, fp_in)) != -1)
+        {
+            rle_compress(line, stdout);
+        }
+        free(line);
+        fclose(fp_in);
+    }
 
     return NULL;
 }
@@ -50,63 +120,52 @@ int main(int argc, char **argv)
 {
     if (argc < 3)
     {
-        printf("wzip: numOfThreads file0 [file1...]");
-        return 1;
+        printf("wpzip: numOfThreads file1 [file2 ...]\n");
+        exit(1);
     }
 
-    FILE *input_file = fopen(argv[2], "rb");
-    if (input_file == NULL)
+    int num_threads = atoi(argv[1]);
+    if (num_threads <= 0 || num_threads > MAX_THREADS)
     {
-        printf("Error: could not open file %s\n", argv[1]);
-        return 1;
+        num_threads = 1;
     }
 
-    int num_chunks = 1;
-    fseek(input_file, 0, SEEK_END);
-    int file_size = ftell(input_file);
-    fseek(input_file, 0, SEEK_SET);
-    if (file_size > CHUNK_SIZE)
+    FileQueue file_queue;
+    init_file_queue(&file_queue);
+
+    // Enqueue all files
+    for (int i = 2; i < argc; i++)
     {
-        num_chunks = file_size / CHUNK_SIZE + (file_size % CHUNK_SIZE != 0);
+        enqueue_file(&file_queue, argv[i]);
     }
-    printf("Compressing file '%s' with %d threads and chunk size %d...\n", argv[1], num_chunks, CHUNK_SIZE);
 
-    pthread_t threads[num_chunks];
-    int thread_args[num_chunks];
-
-    int i;
-    for (i = 0; i < num_chunks; i++)
+    // Create and start worker threads
+    pthread_t threads[num_threads];
+    for (int i = 0; i < num_threads; i++)
     {
-        if (i == num_chunks - 1)
+        if (pthread_create(&threads[i], NULL, compress_file, &file_queue) != 0)
         {
-            uncompressed_size = file_size % CHUNK_SIZE;
-            if (uncompressed_size == 0)
-            {
-                uncompressed_size = CHUNK_SIZE;
-            }
+            fprintf(stderr, "Error: cannot create thread %d\n", i);
+            exit(1);
         }
-        else
+    }
+
+    // Wait for all worker threads to finish
+    for (int i = 0; i < num_threads; i++)
+    {
+        if (pthread_join(threads[i], NULL) != 0)
         {
-            uncompressed_size = CHUNK_SIZE;
+            fprintf(stderr, "Error: cannot join thread %d\n", i);
+            exit(1);
         }
-        fread(uncompressed_data, 1, uncompressed_size, input_file);
-        compressed_size = 0;
-        thread_args[i] = i;
-        pthread_create(&threads[i], NULL, compress_chunk, &thread_args[i]);
     }
 
-    for (i = 0; i < num_chunks; i++)
+    // Flush the remaining compressed data
+    if (prev_char != '\0')
     {
-        pthread_join(threads[i], NULL);
+        fwrite(&count, sizeof(uint32_t), 1, stdout);
+        fwrite(&prev_char, sizeof(char), 1, stdout);
     }
-
-    for (i = 0; i < compressed_size * num_chunks; i++)
-    {
-        fwrite(&compressed_data[i].count, sizeof(int), 1, stdout);
-        fwrite(&compressed_data[i].value, sizeof(char), 1, stdout);
-    }
-
-    fclose(input_file);
 
     return 0;
 }
