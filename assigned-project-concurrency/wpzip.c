@@ -3,12 +3,16 @@
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <sys/types.h>
 
 #define MAX_THREADS 16
 #define QUEUE_SIZE 100
 
 static char prev_char;
 uint32_t count;
+pthread_mutex_t mutex;
+pthread_cond_t cond_var;
+int lock_count = 0;
 
 // Queue to hold file names
 typedef struct
@@ -63,8 +67,9 @@ char *dequeue_file(FileQueue *queue)
 }
 
 // RLE compression function
-void rle_compress(char *s, FILE *fp_out)
+void rle_compress(char *s, FILE *fp_out, char* buffer)
 {
+    char* moving_point = buffer;
     for (int i = 0; i < strlen(s); i++)
     {
         char cur_char = s[i];
@@ -78,8 +83,12 @@ void rle_compress(char *s, FILE *fp_out)
             // different character, write out the previous count and char
             if (prev_char != '\0')
             {
-                fwrite(&count, sizeof(uint32_t), 1, fp_out);
-                fwrite(&prev_char, sizeof(char), 1, fp_out);
+                memcpy(moving_point, &count, sizeof(uint32_t));
+                moving_point = moving_point + sizeof(uint32_t);
+                memcpy(moving_point, &prev_char, sizeof(char));
+                moving_point = moving_point + sizeof(char);
+                //fwrite(&count, sizeof(uint32_t), 1, fp_out);
+                //fwrite(&prev_char, sizeof(char), 1, fp_out);
             }
             // reset count for the new character
             count = 1;
@@ -102,13 +111,32 @@ void *compress_file(void *arg)
             fprintf(stderr, "Error: cannot open file '%s'\n", file);
             continue;
         }
+        //Checking file size would most likely be here
+        //Then make the buffer
+        char buffer[1024] = "";
         char *line = NULL;
         size_t len = 0;
         ssize_t read;
         while ((read = getline(&line, &len, fp_in)) != -1)
         {
-            rle_compress(line, stdout);
+            rle_compress(line, stdout, buffer);
         }
+
+        // Increment counter while holding the mutex
+        pthread_mutex_lock(&mutex);
+        lock_count++;
+
+        // Check if counter value matches expected value
+        while (lock_count != id)
+        {
+            pthread_cond_wait(&cond_var, &mutex);
+        }
+        //Writing to file.
+        fwrite(buffer, sizeof(buffer), 1, stdout);
+
+        // Release the mutex and signal waiting threads
+        pthread_mutex_unlock(&mutex);
+        pthread_cond_broadcast(&cond_var);
         free(line);
         fclose(fp_in);
     }
@@ -166,6 +194,10 @@ int main(int argc, char **argv)
         fwrite(&count, sizeof(uint32_t), 1, stdout);
         fwrite(&prev_char, sizeof(char), 1, stdout);
     }
+
+    // Cleanup
+    pthread_mutex_destroy(&mutex);
+    pthread_cond_destroy(&cond_var);
 
     return 0;
 }
